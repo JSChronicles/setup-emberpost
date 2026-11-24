@@ -1,0 +1,148 @@
+name: Update Emberpost
+
+on:
+  repository_dispatch:
+    types:
+      - emberpost_released
+  workflow_dispatch:
+    inputs:
+      release_sha:
+        description: Full commit SHA for the Emberpost release
+        required: true
+        type: string
+      tag:
+        description: Emberpost release tag, such as v0.3.0
+        required: true
+        type: string
+      version:
+        description: Emberpost version without the v prefix
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: update-emberpost
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Read release metadata
+        id: release
+        env:
+          DISPATCH_SHA: ${{ github.event.client_payload.release_sha }}
+          DISPATCH_TAG: ${{ github.event.client_payload.tag }}
+          DISPATCH_VERSION: ${{ github.event.client_payload.version }}
+          INPUT_SHA: ${{ inputs.release_sha }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="${DISPATCH_SHA:-$INPUT_SHA}"
+          tag="${DISPATCH_TAG:-$INPUT_TAG}"
+          version="${DISPATCH_VERSION:-$INPUT_VERSION}"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Emberpost version '$version' is not a stable semantic version"
+            exit 1
+          fi
+          if [[ "$tag" != "v${version}" ]]; then
+            echo "::error::Emberpost tag '$tag' does not match version '$version'"
+            exit 1
+          fi
+          if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Emberpost release SHA is not a full commit SHA"
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Create pull request token
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.DOWNSTREAM_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.DOWNSTREAM_BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: setup-emberpost
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Update version references
+        env:
+          EMBERPOST_VERSION: ${{ steps.release.outputs.version }}
+        run: node scripts/update-emberpost-version.mjs "$EMBERPOST_VERSION"
+
+      - name: Validate source and bundle
+        run: |
+          npm run format:check
+          npm run lint
+          npm run typecheck
+          npm run ci-test
+          npm run build
+          git diff --exit-code -- dist/
+
+      - name: Smoke test the released version
+        id: setup-emberpost
+        uses: ./
+        with:
+          emberpost-version: ${{ steps.release.outputs.version }}
+
+      - name: Verify installed version
+        env:
+          ACTUAL_VERSION: ${{ steps.setup-emberpost.outputs.emberpost-version }}
+          EXPECTED_VERSION: ${{ steps.release.outputs.version }}
+        shell: bash
+        run: |
+          test "$ACTUAL_VERSION" = "$EXPECTED_VERSION"
+          emberpost --version
+          emberpost --help
+
+      - name: Create or update pull request
+        env:
+          EMBERPOST_SHA: ${{ steps.release.outputs.sha }}
+          EMBERPOST_TAG: ${{ steps.release.outputs.tag }}
+          EMBERPOST_VERSION: ${{ steps.release.outputs.version }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          branch="automation/update-emberpost"
+          git config user.name "${{ steps.app-token.outputs.app-slug }}[bot]"
+          git config user.email "${{ steps.app-token.outputs.app-slug }}[bot]@users.noreply.github.com"
+          git checkout -B "$branch"
+          git add README.md .github/emberpost-compatibility.json
+          if git diff --cached --quiet; then
+            echo "setup-emberpost already records compatibility with Emberpost ${EMBERPOST_VERSION}."
+            exit 0
+          fi
+          git commit -m "fix(deps): update default Emberpost to ${EMBERPOST_VERSION}"
+          git push --force origin "HEAD:refs/heads/${branch}"
+          body="Records compatibility with Emberpost ${EMBERPOST_TAG} (${EMBERPOST_SHA}) and runs the exact-version action smoke test."
+          number=$(gh pr list --head "$branch" --state open --json number --jq '.[0].number // empty')
+          if [[ -n "$number" ]]; then
+            gh pr edit "$number" --title "fix(deps): update default Emberpost to ${EMBERPOST_VERSION}" --body "$body"
+          else
+            url=$(gh pr create --base main --head "$branch" --title "fix(deps): update default Emberpost to ${EMBERPOST_VERSION}" --body "$body" --label dependencies)
+            number=${url##*/}
+          fi
+          gh pr merge "$number" --auto --merge --delete-branch

@@ -1,0 +1,19 @@
+name: Internal Emberpost setup
+description: Internal Node.js setup implementation for setup-emberpost
+
+inputs:
+  emberpost-version:
+    description: Exact Emberpost version to install, or "latest"
+    required: true
+  python-version:
+    description: Optional Python version override
+    required: false
+    default: ''
+
+outputs:
+  emberpost-version:
+    description: The exact installed Emberpost version
+
+runs:
+  using: node24
+  main: index.js

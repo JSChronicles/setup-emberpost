@@ -1,0 +1,39 @@
+name: Setup Emberpost
+description: Set up an isolated Emberpost CLI in GitHub Actions
+author: JSChronicles
+
+branding:
+  icon: send
+  color: orange
+
+inputs:
+  emberpost-version:
+    description: Exact Emberpost version to install, or "latest"
+    required: false
+    default: latest
+  python-version:
+    description:
+      Optional Python version override for the isolated Emberpost runtime
+    required: false
+    default: ''
+
+outputs:
+  emberpost-version:
+    description: The exact installed Emberpost version
+    value: ${{ steps.setup-emberpost.outputs.emberpost-version }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install uv
+      uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      with:
+        version: '0.12.16'
+        enable-cache: false
+
+    - name: Set up Emberpost
+      id: setup-emberpost
+      uses: $/dist/setup
+      with:
+        emberpost-version: ${{ inputs.emberpost-version }}
+        python-version: ${{ inputs.python-version }}

@@ -1,0 +1,103 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  continuous-integration:
+    name: Continuous integration
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
+  check-dist:
+    name: Check bundled JavaScript
+    permissions:
+      contents: read
+    uses: ./.github/workflows/check-dist.yml
+
+  release:
+    name: Publish semantic release
+    needs:
+      - continuous-integration
+      - check-dist
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Publish release
+        id: release
+        shell: bash
+        env:
+          GH_REPO: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          published_tag=$(gh release list --exclude-drafts --limit 1 --json tagName --jq '.[0].tagName // ""')
+          if [[ -z "$published_tag" ]]; then
+            version=$(node -p "require('./package.json').version")
+            tag="v$version"
+            gh release create "$tag" --target "$GITHUB_SHA" --generate-notes --latest
+          else
+            npm exec -- semantic-release
+          fi
+
+          git fetch --force --tags origin
+          tag=$(git tag --points-at "$GITHUB_SHA" --list 'v*' --sort=-version:refname |
+            grep -E '^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$' |
+            head -n 1 || true)
+          if [[ -z "$tag" ]]; then
+            echo 'released=false' >> "$GITHUB_OUTPUT"
+          else
+            echo 'released=true' >> "$GITHUB_OUTPUT"
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create or update floating major tag
+        if: steps.release.outputs.released == 'true'
+        shell: bash
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          version=${RELEASE_TAG#v}
+          version_without_build=${version%%+*}
+          if [[ "$version_without_build" == *-* ]]; then exit 0; fi
+          major=${version%%.*}
+          floating_tag="v$major"
+          target_sha=$(gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')
+          floating_count=$(gh api "repos/$GH_REPO/git/matching-refs/tags/$floating_tag" |
+            jq --arg ref "refs/tags/$floating_tag" '[.[] | select(.ref == $ref)] | length')
+          if [[ "$floating_count" == '0' ]]; then
+            gh api --method POST "repos/$GH_REPO/git/refs" -f ref="refs/tags/$floating_tag" -f sha="$target_sha" >/dev/null
+          else
+            gh api --method PATCH "repos/$GH_REPO/git/refs/tags/$floating_tag" -f sha="$target_sha" -F force=true >/dev/null
+          fi
